@@ -1,0 +1,58 @@
+#!/bin/ksh
+execDate=`date`
+logDate=`date '+%C%y%m%d'`
+#logDir=/usr/twp/nagios/logFiles
+logDir=/local/monitorLogs
+logFile=${logDir}/nagiosEvents.${logDate}
+test -f $logFile
+if [ $? -ne 0 ]
+then
+   find $logDir -mtime +3 -name "nagiosEvents*" -exec rm {} ';'
+   cat /dev/null > $logFile
+fi
+/bin/echo "" >> $logFile
+/bin/echo "Executing hostEvent event-handler: $execDate" >> $logFile
+/bin/echo "       arg1: $1" >> $logFile
+/bin/echo "       arg2: $2" >> $logFile
+/bin/echo "       arg3: $3" >> $logFile
+/bin/echo "       arg4: $4" >> $logFile
+#
+hostID=$1
+case $2 in
+                UP) alertSuffix=Okay ;;
+              DOWN) alertSuffix=Crit ;;
+       UNREACHABLE) alertSuffix=Crit ;;
+                 *) alertSuffix=Warn ;;
+esac
+/bin/echo "alertSuffix: $alertSuffix" >> $logFile
+if [ $alertSuffix != Okay ]
+then
+   if [ $3 = SOFT ]
+   then
+      /bin/echo "exit due to non-Okay and SOFT" >> $logFile
+      exit 0
+   fi
+fi
+#
+alertRoot=Ping
+/bin/echo "$arg3" | grep -E "indicates|Message~suppressed|one-hour-old" > /dev/null
+if [ $? -eq 0 ]
+then
+   exit 0
+fi
+outLine="${alertRoot}${alertSuffix}~locLookup~appLookup~${hostID}~${hostID}~occLookup~"
+/bin/echo "    outLine: ${outLine}" >> $logFile
+#ssh tsspat@nfraus /home/tsspat/scripts/ssOut Nagios 2 3 4 5 6 "${outLine}"
+/local/monitorScripts/alertDriver Nagios 2 3 4 5 6 "${outLine}"
+#
+exit 0
+pid=$$
+mailFile=/tmp/eventHandlerVars.$pid
+/bin/echo "1: $1" > $mailFile
+/bin/echo "2: $2" >> $mailFile
+/bin/echo "3: $3" >> $mailFile
+/bin/echo "4: $4" >> $mailFile
+/bin/echo "5: $5" >> $mailFile
+/bin/echo "6: $6" >> $mailFile
+mail -s "toNagios variables" andersonm@washpost.com < $mailFile
+rm $mailFile
