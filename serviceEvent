@@ -1,10 +1,24 @@
 #!/bin/ksh
+updateDynamicServiceCaptures ()
+{
+/bin/echo "##### updateDynamicServiceCaptures #####" >> $logFile
+#
+if [ "$nagiosApp" = "APPNAME" ]
+then
+   dsfApp=""
+else
+   dsfApp=$nagiosApp
+fi
+serviceEntry="${nagiosSvcDesc}|${nagiosAttempts}|${dsfApp}|"
+/bin/echo "$serviceEntry" >> $dynamicServiceFile
+/bin/echo "   adding serviceEntry ${serviceEntry}" >> $logFile
+}
 checkForELB ()
 {
 /bin/echo "##### checkForELB #####" >> $logFile
 #
 nagiosHostNameArg="_${nagiosHostName}_|"
-awsInstanceLine=$(/bin/grep ${nagiosHostNameArg} ${parmDir}/AWS_instance-host-xref_* | /usr/bin/head -n 1)
+awsInstanceLine=$(/bin/grep ${nagiosHostNameArg} ${awsParmDir}/AWS_instance-host-xref_* | /usr/bin/head -n 1)
 if [ "$awsInstanceLine" != "" ]
 then
    /bin/echo "      awsInstanceLine: ${awsInstanceLine}" >> $logFile
@@ -26,11 +40,11 @@ then
    if [ "$ailHostName" = "$nagiosHostName" ]
    then
 #     Prefix the slashes in parmDir for processing with sed command
-      parmDirArg=$(/bin/echo ${parmDir} | /bin/sed 's/\//\\\//g')
+      parmDirArg=$(/bin/echo ${awsParmDir} | /bin/sed 's/\//\\\//g')
       elbName=$(/bin/echo ${awsInstanceLine} | /bin/cut -f1 -d":" | /bin/sed "s/${parmDirArg}\/AWS_instance-host-xref_//g")
       /bin/echo "              elbName: ${elbName}" >> $logFile
       dynamicServiceFileName=AWS_dynamicServiceCaptures_${elbName}
-      dynamicServiceFile=${parmDir}/${dynamicServiceFileName}
+      dynamicServiceFile=${awsParmDir}/${dynamicServiceFileName}
       /usr/bin/test -f ${dynamicServiceFile}
       if [ $? -ne 0 ]
       then
@@ -42,20 +56,47 @@ then
       /bin/echo "$nagiosSvcDesc" | /bin/grep ACCUMULATE > /dev/null
       if [ $? -ne 0 ]
       then
-         /bin/grep "$nagiosSvcDesc" $dynamicServiceFile > /dev/null
+#        This is not an ACCUMLATE START nor an ACCUMULATE STOP so it represents
+#        an actual needed service
+#        Look for an exact match in the dynamic service capture file
+#        (append a pipe symbol to assure any match is unique)
+         svcDescArg="${nagiosSvcDesc}|"
+         /bin/grep "$svcDescArg" $dynamicServiceFile > /dev/null
          if [ $? -ne 0 ]
          then
-            if [ "$nagiosApp" = "APPNAME" ]
-            then
-               dsfApp=""
-            else
-               dsfApp=$nagiosApp
-            fi
-            serviceEntry="${nagiosSvcDesc}|${nagiosAttempts}|${dsfApp}|"
-            /bin/echo "$serviceEntry" >> $dynamicServiceFile
-            /bin/echo "   adding serviceEntry ${serviceEntry}" >> $logFile
+#           No match was found, add the service to the dynamic service capture
+#           file
+            updateDynamicServiceCaptures
          else
-            /bin/echo "   serviceEntry \"${nagiosSvcDesc}\" already exists" >> $logFile
+#           A match was found, copy all lines from the dynamic service file to
+#           a backup EXCLUDING THE MATCHING SERVICE
+            dynamicSvcsBackup=/tmp/dynamicSvcsBackup_${pid}
+            /bin/cat $dynamicServiceFile | /bin/grep -v "$svcDescArg" > $dynamicSvcsBackup
+#           For each line in the backup file, if the service does not match a
+#           service already in the dynamic service file, copy the backup file
+#           line into the dynamic service file (multiple, simultaneous updates
+#           may be occurring and we need to prevent duplicates from being added
+#           to the dynamic service file)
+            for dsbLine in `/bin/cat $dynamicSvcsBackup`
+            do
+               oldIFS="$IFS"
+               IFS="|"
+               set -- $dsbLine
+               dsbSvcDesc=$1
+               IFS="$oldIFS"
+#              Ensure that any match is unique (append the pipe symbol)
+               dsbSvcDescArg="${dsbSvcDesc}|"
+               /bin/grep "$dsbSvcDescArg" $dynamicServiceFile > /dev/null
+               if [ $? -ne 0 ]
+               then
+                  /bin/echo "$dsbLine" >> $dynamicServiceFile
+               fi
+            done
+            /bin/rm $dynamicSvcsBackup
+#           Now that dynamic service file has all its original entries minus
+#           the one being updated (currently processed line) so we can add
+#           the line currently being processed
+            updateDynamicServiceCaptures
          fi
       else
          /bin/echo "              ignoring ${serviceEntry}" >> $logFile
@@ -105,22 +146,56 @@ then
    then
       read fqdnValue < $nslookupFile
       /bin/echo "                 FQDN: ${fqdnValue}" >> $logFile
-      targetDir=$objectStagingDir
-      /usr/bin/test -d $targetDir
-      if [ $? -ne 0 ]
-      then
-         /bin/mkdir $targetDir
-      fi
    else
       /bin/echo "hostname nslookup produced multiple output lines" >> $logFile
       /bin/echo "          FQDN not found" >> $logFile
-      fqdnValue=ALIAS
+      fqdnValue=$ipValue
    fi
 else
    /bin/echo "hostname nslookup produced no output lines" >> $logFile
    /bin/echo "          FQDN not found" >> $logFile
-   fqdnValue=ALIAS
+   fqdnValue=$ipValue
 fi
+}
+#
+processLocation ()
+{
+/bin/echo "##### processLocation #####" >> $logFile
+#
+# The location was determined
+ /bin/echo "             location: ${locValue}" >> $logFile
+ locValue="z${locValue}"
+# Failure to get FQDN via nslookup used to prevent auto-deployment and
+# objects were stored in the "incomplete" directory, not anymore - now
+# we'll use the IP address as the FQDN if nslookup fails
+targetDir=$objectStagingDir
+/usr/bin/test -d $targetDir
+if [ $? -ne 0 ]
+then
+   /bin/mkdir $targetDir
+fi
+# Use nslookup to retrieve the host's FQDN
+nslookupFile=/tmp/serviceEvent_nslookup_${pid}
+/usr/bin/nslookup ${ipValue} | /bin/grep "name = " | /bin/cut -f2 -d"=" | /bin/sed 's/ //g' | /bin/sed 's/com\./com/g' > $nslookupFile
+nslookupOutputCount=$(/bin/cat ${nslookupFile} | /usr/bin/wc -l | /bin/sed 's/ //g')
+if [ $nslookupOutputCount -gt 0 ]
+then
+   if [ $nslookupOutputCount -eq 1 ]
+   then
+      read fqdnValue < $nslookupFile
+      /bin/echo "                 FQDN: ${fqdnValue}" >> $logFile
+   else
+      /bin/echo "IP nslookup output produced multiple lines" >> $logFile
+      nslookupUsingHostname
+   fi
+else
+   /bin/echo "IP nslookup produced no output lines" >> $logFile
+   /bin/echo "          FQDN not found" >> $logFile
+#  fqdnValue=ALIAS
+   fqdnValue=$ipValue
+   nslookupUsingHostname
+fi
+/bin/rm $nslookupFile
 }
 #
 getOtherHostInfo ()
@@ -130,51 +205,38 @@ getOtherHostInfo ()
 # Remove the underscores surrounding IP address in the hostAppTab entry
 ipValue=$(/bin/echo ${ipValue} | /bin/sed 's/_//g')
 /bin/echo "           IP address: ${ipValue}" >> $logFile
-# Use first two octets of the IP address to lookup the related location
+# Use first three octets of the IP address to lookup the related location
 locTab=${parmDir}/octet2LocTab
 oldIFS="$IFS"
 IFS="."
 set -- $ipValue
 octet1=$1
 octet2=$2
+octet3=$3
 IFS="$oldIFS"
-octetArg="${octet1}.${octet2}."
-locValue=$(/bin/grep ${octetArg} $locTab | /bin/cut -f2 -d"|")
+octetArg="${octet1}.${octet2}.${octet3}.|"
+/bin/echo "       3-octet lookup: ${octetArg}" >> $logFile
+locValue=$(/bin/grep ${octetArg} ${locTab} | /bin/cut -f2 -d"|")
 if [ "$locValue" != "" ]
 then
-#  The location was determined
-   /bin/echo "             location: ${locValue}" >> $logFile
-   locValue="z${locValue}"
-#  Use nslookup to retrieve the host's FQDN
-   nslookupFile=/tmp/serviceEvent_nslookup_${pid}
-   /usr/bin/nslookup ${ipValue} | /bin/grep "name = " | /bin/cut -f2 -d"=" | /bin/sed 's/ //g' | /bin/sed 's/com\./com/g' > $nslookupFile
-   nslookupOutputCount=$(/bin/cat ${nslookupFile} | /usr/bin/wc -l | /bin/sed 's/ //g')
-   if [ $nslookupOutputCount -gt 0 ]
-   then
-      if [ $nslookupOutputCount -eq 1 ]
-      then
-         read fqdnValue < $nslookupFile
-         /bin/echo "                 FQDN: ${fqdnValue}" >> $logFile
-         targetDir=$objectStagingDir
-         /usr/bin/test -d $targetDir
-         if [ $? -ne 0 ]
-         then
-            /bin/mkdir $targetDir
-         fi
-      else
-         /bin/echo "IP nslookup output produced multiple lines" >> $logFile
-         nslookupUsingHostname
-      fi
-   else
-      /bin/echo "IP nslookup produced no output lines" >> $logFile
-      /bin/echo "          FQDN not found" >> $logFile
-      fqdnValue=ALIAS
-      nslookupUsingHostname
-   fi
-   /bin/rm $nslookupFile
+#  Location found
+   /bin/echo "                   location found: ${locValue}" >> $logFile
+   processLocation
 else
-   /bin/echo "      location not found" >> $logFile
-   locValue=LOCATION
+#  Location not found
+#  Use first two octets of the IP address to lookup the related location
+   octetArg="${octet1}.${octet2}.|"
+   /bin/echo "       2-octet lookup: ${octetArg}" >> $logFile
+   locValue=$(/bin/grep ${octetArg} ${locTab} | /bin/cut -f2 -d"|")
+   if [ "$locValue" != "" ]
+   then
+#     Location found
+      /bin/echo "                   location found: ${locValue}" >> $logFile
+      processLocation
+   else
+      /bin/echo "      location not found" >> $logFile
+      locValue=LOCATION
+   fi
 fi
 }
 #
@@ -362,11 +424,58 @@ entityName=$(/bin/echo ${entityLabel} | /bin/sed 's/\//\\\//g')
 supplyGraphiteLink
 }
 #
+mtrMail ()
+{
+/bin/echo "##### mtrMail #####" >> $logFile
+#
+oldIFS="$IFS"
+IFS="!"
+set -- $serviceOutput
+linePrefix=$1
+lineMessage=$2
+IFS="@"
+set -- $linePrefix
+mailID=$1
+lineSequence=$2
+IFS="$oldIFS"
+mailContentFile=/tmp/mtrMailContent_$mailID
+mailSubjectFile=/tmp/mtrMailSubject_$mailID
+/usr/bin/test -f $mailContentFile
+if [ $? -ne 0 ]
+then
+   /bin/cat /dev/null > $mailContentFile
+fi
+case $lineSequence in
+   001) /bin/echo "$lineMessage" > $mailSubjectFile ;;
+     *) /bin/echo "$lineMessage" | /bin/grep "ACCUMULATE STOP" > /dev/null
+        if [ $? -ne 0 ]
+        then
+           /bin/echo "$lineMessage" >> $mailContentFile
+        else
+           /usr/bin/test -s $mailSubjectFile
+           if [ $? -eq 0 ]
+           then
+              /bin/echo "DISABLED! sending mail" >> $logFile
+#              /bin/echo "sending mail" >> $logFile
+#              read mailSubject < $mailSubjectFile
+#              for mtrMailTarget in `/bin/cat /local/monitorParms/mtrMailTargets`
+#              do
+#                 /bin/mail -s "${mailSubject}" -r monitoring@washpost.com $mtrMailTarget < $mailContentFile > /dev/null 2>&1
+#              done
+           fi
+           /bin/rm $mailSubjectFile
+           /bin/rm $mailContentFile
+        fi ;;
+esac
+exit 0
+}
+#
 serviceSetup ()
 {
 /bin/echo "##### serviceSetup #####" >> $logFile
 #
 parmDir=/local/monitorParms
+awsParmDir=${parmDir}/AWS
 #
 oldIFS="$IFS"
 IFS="@"
@@ -589,7 +698,7 @@ else
 fi
 #
 case $nagiosSvcType in
-   Directory|File|Filesystem|IfacePkts|Iostat|JMX|MTR|Nginx|OldFiles|Process|ProcessCPU|ProcessMemory|URLMon)
+   Directory|File|FileRead|Filesystem|IfacePkts|Iostat|JMX|MongoDBSpace|MTR|Nginx|OldFiles|Process|ProcessCPU|ProcessMemory|URLMon)
       lockFile=${stageLockDir}/${lockFileName}
       case $nagiosSvcParm in
          "ACCUMULATE START") /bin/echo "                 case ACCUMULATE START" >> $logFile
@@ -597,12 +706,13 @@ case $nagiosSvcType in
                              /usr/bin/test -f $lockFile
                              if [ $? -ne 0 ]
                              then
-                                /bin/echo "                 creating ${targetFileName} lock" >> $logFile
-                                /bin/touch $lockFile
+                                lockEpoch=$(/bin/date '+%s')
+                                /bin/echo "                 creating ${targetFileName} lock with epoch ${lockEpoch}" >> $logFile
+                                /bin/echo "$lockEpoch" > $lockFile
                              else
                                 /bin/echo "                 ${targetFileName} lock found" >> $logFile
                              fi ;;
-          "ACCUMULATE STOP") /bin/echo "                 case ACCUMLATE STOP" >> $logFile
+          "ACCUMULATE STOP") /bin/echo "                 case ACCUMULATE STOP" >> $logFile
                              /usr/bin/test -f $lockFile
                              if [ $? -eq 0 ]
                              then
@@ -615,7 +725,7 @@ case $nagiosSvcType in
                           *) /bin/cat $modelCfg | /bin/sed "s/USETEMPLATE/$template/g" | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/APPNAME/$appValue/g" | /bin/sed "s/SERVICEDESC/$nagiosSvcParm/g" | /bin/sed "s/MAXCHECKATTEMPTS/$nagiosAttempts/g" >> $targetFile
                              graphiteLinkModelName="GraphiteLink_${nagiosSvcType}"
                              case $nagiosSvcType in
-             Directory|Filesystem|IfacePkts|OldFiles|ProcessCPU|ProcessMemory)
+             Directory|Filesystem|FileRead|IfacePkts|OldFiles|ProcessCPU|ProcessMemory)
                                             processEntityLabelForGraphiteLink ;;
                              esac
                              /bin/echo "}" >> $targetFile
@@ -687,9 +797,41 @@ nscaPkt="${hostID}${tab}${nagiosSvc}${tab}${forcedStatus}${tab}${statusInfo}"
 exit 0
 }
 #
+checkSocShiftOverride ()
+{
+# Set the oncall-code to SOC for a given Nagios service between 8PM-6AM daily
+alertHour=$(/bin/date '+%k')
+/bin/echo "    entering checkSocShiftOverride routine" >> $logFile
+/bin/echo "    hour: ${alertHour}" >> $logFile
+if [ $alertHour -ge 20 -o $alertHour -le 5 ]
+then
+   /bin/echo "    hour is covered by SOC shift, alert sent to SOC" >> $logFile
+   ocCode=SOC
+else
+   /bin/echo "    hour is not covered by SOC shift" >> $logFile
+fi
+}
+#
 checkAlertOverrides ()
 {
-#aoParms=/usr/twp/nagios/monitorParms/alertOverrides
+#
+actionKeyLog=${logDir}/actionKeyLog.${logDate}
+/usr/bin/test -f $actionKeyLog
+if [ $? -ne 0 ]
+then
+   /bin/touch $actionKeyLog
+   /bin/chmod 0777 $actionKeyLog
+   /usr/bin/find $logDir -mtime +4 -name "actionKeyLog*" -exec /bin/rm {} ';'
+fi
+logTime=$(/bin/echo ${execDate} | /bin/awk '{print $4}')
+actionKeyTempFile=/tmp/serviceEvent_actionKeys_${pid}_${logTime}
+/bin/echo "" > $actionKeyTempFile
+/bin/echo "        ${logTime}" >> $actionKeyTempFile
+/bin/echo "          script: serviceEvent" >> $actionKeyTempFile
+/bin/echo "    event handler key parms (nagiosEventHandlerOverrides)" >> $actionKeyTempFile
+/bin/echo "     Nagios host: ${hostID}" >> $actionKeyTempFile
+/bin/echo "  Nagios service: ${nagiosSvc}" >> $actionKeyTempFile
+/bin/echo "  Nagios message: ${serviceOutput}" >> $actionKeyTempFile
 #
 if [ "$hostIDArg" = "" ]
 then
@@ -709,10 +851,12 @@ aoArg="=${hostIDArg}=~${alertRootArg}~${entityArg}"
 /bin/echo "     ---------------------" >> $logFile
 /bin/echo "     alert override check:" >> $logFile
 /bin/echo "     AO Arg: ${aoArg}" >> $logFile
+/bin/echo "    override key: ${aoArg}" >> $actionKeyTempFile
 aoLine=""
 aoLine=`/bin/cat $aoParms | /bin/grep "$aoArg"`
 if [ "$aoLine" != "" ]
 then
+   /bin/echo "                  matched" >> $actionKeyTempFile
    /bin/echo "    AO Line: ${aoLine}" >> $logFile
    entityHold=`/bin/echo $aoLine | /bin/cut -f2 -d"|"`
    ocCodeHold=`/bin/echo $aoLine | /bin/cut -f3 -d"|"`
@@ -736,10 +880,16 @@ then
    fi
 else
    /bin/echo "    No match in alert override parms" >> $logFile
+   /bin/echo "                  unmatched" >> $actionKeyTempFile
 fi
 /bin/echo "     ---------------------" >> $logFile
+#
+/bin/cat $actionKeyTempFile >> $actionKeyLog
+/bin/rm $actionKeyTempFile
 }
 #
+IFS="
+"
 nscaTargetFile=/local/monitorParms/nscaTarget.dta
 /usr/bin/test -s $nscaTargetFile
 if [ $? -eq 0 ]
@@ -769,6 +919,7 @@ fi
 /bin/echo "       arg5: $5" >> $logFile
 /bin/echo "       arg6: $6" >> $logFile
 /bin/echo "       arg7: $7" >> $logFile
+/bin/echo "       arg8: $8" >> $logFile
 #
 arg1="$1"
 arg2="$2"
@@ -879,6 +1030,8 @@ case $serviceType in
            "Argus Metrics") alertRoot=Argus
                             entity=Argus
                             checkAlertOverrides ;;
+          "AWS VPC Status") alertRoot=AWSVPC
+                            checkAlertOverrides ;;
  "Cache Profile Statistic") alertRoot=CacheProfStat
                             entity=CacheProfStat
                             checkAlertOverrides ;;
@@ -891,14 +1044,26 @@ case $serviceType in
             "CPU Load") alertRoot=CPU
                         entity=CPU
                         checkAlertOverrides ;;
+  "Crashlytics Status") alertRoot=Crashlytics
+                        entity=Crashlytics
+                        checkAlertOverrides ;;
        "debuginfo.jsp") alertRoot=DebugJSP
                         entity=debugjsp
+                        checkAlertOverrides ;;
+"Digital Subscriber Count") alertRoot=DigitalSubs
+                        entity=DigitalSubs
                         checkAlertOverrides ;;
              Directory) alertRoot=Directory
                         checkAlertOverrides ;;
         "DNS Response") alertRoot=DNSResponse
                         checkAlertOverrides ;;
+"DNS Reverse Lookup Response") alertRoot=DNSReverse
+                        entity=DNSReverseLookup
+                        checkAlertOverrides ;;
          "Drive Space") alertRoot=Drive
+                        checkAlertOverrides ;;
+"ELB HTTP Response Codes") alertRoot=ELBHttpCode
+                        entity=ELBHttpCode
                         checkAlertOverrides ;;
      "ELB Host Health") alertRoot=ELBHostHealth
                         entity=ELB-instances
@@ -914,14 +1079,24 @@ case $serviceType in
                         checkAlertOverrides ;;
 "Eomdb Call Statistics") alertRoot=EomdbCallStats
                         checkAlertOverrides ;;
+"Eomdb Session Review") alertRoot=EomdbSessions
+                        checkAlertOverrides ;;
                   File) alertRoot=File
+                        checkAlertOverrides ;;
+           "File Read") alertRoot=FileRead
                         checkAlertOverrides ;;
 "File SCP Performance") alertRoot=SCP
                         ocCode=commaint ;;
             Filesystem) alertDriverScript=alertDriverRmt ;;
+  "Graphite Interface") alertRoot=GraphiteIF
+                        entity=GraphiteInterface
+                        checkAlertOverrides ;;
    "Host Date Capture") hostDateRoutine ;;
             "Idoc Age") alertRoot=IdocAge
                         entity=IdocAge
+                        checkAlertOverrides ;;
+"Instance Network I-O") alertRoot=InstanceNetwork
+                        entity=InstanceNetwork
                         checkAlertOverrides ;;
    "Interface Packets") alertRoot=Iface
                         checkAlertOverrides ;;
@@ -951,7 +1126,8 @@ case $serviceType in
                         checkAlertOverrides ;;
                Metadev) alertDriverScript=alertDriverRmt ;;
      "Meter Use Cases") alertRoot=MeterUseCases
-                        location=Tysons
+                        entity=MeterUseCases
+                        location=RagingWire
                         checkAlertOverrides ;;
  "Mobile Server Side Telemetry") alertRoot=MSST
                         entity=MobileServerSideTelemetry
@@ -964,10 +1140,47 @@ case $serviceType in
                            entity="MongoDBStats:${entity}"
                         fi
                         checkAlertOverrides ;;
-      "MTR Statistics") alertRoot=MTR
-                        hostIDArg=MTRHosts
-                        entityArg=MTR
+"MSExchange Component States") alertRoot=MSExComp
+                        entity=MSExchange
                         checkAlertOverrides ;;
+"MSExchange DAG Health") alertRoot=MSExDAG
+                        entity=MSExchange
+                        checkAlertOverrides ;;
+"MSExchange Service Health") alertRoot=MSExSvc
+                        checkAlertOverrides ;;
+    "MTR Mail Capture") mtrMail ;;
+      "MTR Statistics") hostAppTab=/local/monitorParms/hostAppTab
+                        hatArg="_${entity}_"
+                        ocCode=$(/bin/grep ${hatArg} ${hostAppTab} | /bin/cut -f5 -d"|" | /bin/cut -f2 -d"=")
+                        alertRoot=MTR
+                        if [ "$ocCode" = "" ]
+                        then
+                           hostIDArg=MTRHosts
+                           entityArg=MTR
+                           checkAlertOverrides
+                        fi
+                        entityQualifier=""
+                        for errorType in 1 2 3 4 5
+                        do
+                           case $errorType in
+                              1) errorMsg="no output"
+                                 entityQualifier=NoOutput ;;
+                              2) errorMsg="slow response"
+                                 entityQualifier=SlowResponse ;;
+                              3) errorMsg="packet loss"
+                                 entityQualifier=PacketLoss ;;
+                              4) errorMsg="hop count"
+                                 entityQualifier=HopCount ;;
+                              5) errorMsg="hop address"
+                                 entityQualifier=HopAddress ;;
+                           esac
+                           /bin/echo "$6" | /bin/grep "$errorMsg" > dev/null
+                           if [ $? -eq 0 ]
+                           then
+                              break
+                           fi
+                        done
+                        entity="${entity}@${entityQualifier}@" ;;
 "MySQL Replication Status") alertRoot=MySQLRepl
                         entity=MySQLRepl
                         checkAlertOverrides ;;
@@ -981,25 +1194,37 @@ case $serviceType in
                         checkAlertOverrides ;;
      "Old Files Check") alertRoot=OldFile
                         checkAlertOverrides ;;
+    "OM Job Durations") alertRoot=OMJob
+                        entity=OMJob
+                        checkAlertOverrides ;;
  "Omniture Record Recency") alertRoot=OmniRecs
                         entity=OmniRecs
-                        checkAlertOverrides ;;
-         "Ping Status") alertRoot=Ping
-                        entity=Ping
                         checkAlertOverrides ;;
 "Oracle DB Connect Status") alertRoot=OracleConnect
                         checkAlertOverrides
                         entity="OracleConnect_${entity}" ;;
       "Oracle Metrics") alertRoot=OracleMetrics
                         checkAlertOverrides ;;
+"Paywall Dash Instance Validation") alertRoot=PaywallDashInst
+                        entity=PaywallMeterDashInstances
+                        checkAlertOverrides ;;
+         "Ping Status") alertRoot=Ping
+                        entity=Ping
+                        checkAlertOverrides ;;
 "Politistream Metrics") alertRoot=Politistream
                         entity=Politistream
+                        checkAlertOverrides ;;
+                "Port") alertRoot=Port
+                        entity=$(/bin/echo ${entity} | /bin/sed 's/ /_/g')
                         checkAlertOverrides ;;
 "Portal Processing Times") alertRoot=PortalProcTime
                         entity=PortalProcTime
                         checkAlertOverrides ;;
  "Portal Publish Time") alertRoot=PortalPubTime
                         entity=PortalPubTime
+                        checkAlertOverrides ;;
+"PostClassic Bundle Test") alertRoot=PostClassicBundleTest
+                        entity=PostClassicBundleTest
                         checkAlertOverrides ;;
     "Postgres Metrics") alertRoot=Postgres
                         alertRootArg=Postgres
@@ -1029,6 +1254,20 @@ case $serviceType in
                         alertRootArg=Postgres
                         entityArg=Postgres
                         checkAlertOverrides ;;
+      "PostTV Latency") alertRoot=PostTVLatency
+                        alertRootArg=PostTV
+                        entityArg=Latency
+                        checkAlertOverrides ;;
+       "PostTV Errors") alertRoot=PostTVErrors
+                        alertRootArg=PostTV
+                        entity=Errors
+                        checkAlertOverrides ;;
+"Print Edition Section Bundle Check") alertRoot=PostClassicSectionBundle
+                        entity=PostClassicSectionBundle
+                        checkAlertOverrides ;;
+"Print Edition Silent Push Check") alertRoot=PostClassicSilentPush
+                        entity=PostClassicSilentPush
+                        checkAlertOverrides ;;
                Process) alertRoot=Process
                         entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
                         checkAlertOverrides ;;
@@ -1038,12 +1277,26 @@ case $serviceType in
                         checkAlertOverrides ;;
 "Process Memory Footprint") alertRoot=ProcMem
                         entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        entity="${entity}:ProcessMemoryFootprint"
                         checkAlertOverrides ;;
 "prodArch Servlet Statistics") alertRoot=prodArchServletStats
                         entity=prodArchServletStats
                         checkAlertOverrides ;;
+"Publishing End-to-End") alertRoot=PublishingPipe
+                        entity=PublishingPipe
+                        checkAlertOverrides ;;
+"RabbitMQ Queue Stats") alertRoot=RabbitMQ
+                        entityArg=$entity
+                        checkAlertOverrides ;;
+"RabbitMQ Total Messages for All Queues") alertRoot=RabbitMQTot
+                        entity=total_msgs
+                        entityArg=total_msgs
+                        checkAlertOverrides ;;
 "RDS Free Storage Space") alertRoot=RDSFreeSpace
                         entity=RDSFreeSpace
+                        checkAlertOverrides ;;
+"Redis Sentinel Metrics") alertRoot=Redis
+                        entity=Redis
                         checkAlertOverrides ;;
    "Replica Set Stats") alertRoot=ReplSetStats
                         if [ "$entity" = "" ]
@@ -1052,6 +1305,9 @@ case $serviceType in
                         else
                            entity="ReplSetStats:${entity}"
                         fi
+                        checkAlertOverrides ;;
+   "Router Interfaces") alertRoot=RouterIfaces
+                        entity=$(/bin/echo ${entity} | /bin/sed 's/ /@/g')
                         checkAlertOverrides ;;
  "Server Availability") alertRoot=Server
                         entity=`/bin/echo $6 | /bin/cut -f1 -d":" | /bin/sed 's/ /@/g'`
@@ -1077,9 +1333,29 @@ case $serviceType in
 "Single Copy Job Failures") alertRoot=SingleCopyJobs
                         entity=SingleCopyJobs
                         checkAlertOverrides ;;
+    "Site Performance") alertRoot=SitePerf
+                        location=RagingWire
+                        /bin/echo "$6" | /bin/grep -E "RumDS not returning data|curl returned httpCode" > /dev/null
+                        if [ $? -eq 0 ]
+                        then
+                           entityArg=NoData
+                           entityQualifier=NoData
+                        else
+                           entityArg=SitePerf
+                           entityQualifier=SitePerf
+                        fi
+                        checkAlertOverrides
+                        entity="${entity}@${entityQualifier}@" ;;
  "SiteSearch Article Recency") alertRoot=SearchArticleRecency
                         entity=SearchArticleRecency
                         checkAlertOverrides ;;
+                Splunk) alertRoot=Splunk
+                        entity=$(/bin/echo ${entity} | /bin/sed 's/ /@/g')
+                        checkAlertOverrides ;;
+          "SSL Checks") alertRoot=SSLCheck
+                        entity=SSLCheck
+                        checkAlertOverrides
+                        checkSocShiftOverride ;;
  "Synthetic PortalPub Transaction") alertRoot=SynPortalPub
                         entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
                         checkAlertOverrides ;;
@@ -1098,6 +1374,9 @@ case $serviceType in
                         checkAlertOverrides ;;
   "Versant Statistics") alertRoot=VersantStats
                         entity=VersantStats
+                        checkAlertOverrides ;;
+      "Vmstat Metrics") alertRoot=Vmstat
+                        entity=Vmstat
                         checkAlertOverrides ;;
            WebPageTest) alertRoot=WebPageTest
                         entity=WebPageTest
@@ -1124,7 +1403,7 @@ fi
 #
 # If the received message contains one of these values, it has come from one of the
 # alert "driver" scripts and should be dropped so as not to be sent back to that script
-/bin/echo "$arg3" | /bin/grep -E "indicates|Message~suppressed|one-hour-old" > /dev/null
+/bin/echo "$arg3" | /bin/grep -E "indicates|Message~suppressed|message@was@suppressed|message~was~suppressed|Notification~suppressed|one-hour-old" > /dev/null
 if [ $? -eq 0 ]
 then
    /bin/echo "alert message from ${alertDriverScript}, exiting" >> $logFile
@@ -1178,31 +1457,80 @@ then
    esac
 fi
 #
-if [ "$alertSuffix" = "Crit" ]
+case $alertRoot in
+   SSLCheck)
+      downGradeEligible=No ;;
+   *)
+      if [ "$alertSuffix" = "Crit" ]
+      then
+         hostAppTab=/local/monitorParms/hostAppTab
+         hostArg="_${hostID}_"
+         hatLine=`/bin/grep "$hostArg" $hostAppTab`
+         if [ "$hatLine" != "" ]
+         then
+            oldIFS="$IFS"
+            IFS="|"
+            set -- $hatLine
+            criticalityCode=$3
+            IFS="$oldIFS"
+            /bin/echo "  crit code: $criticalityCode" >> $logFile
+            if [ "$criticalityCode" = "N" ]
+            then
+               alertSuffix=Warn
+            fi
+            /bin/echo "alertSuffix: $alertSuffix" >> $logFile
+         fi
+      fi ;;
+esac
+#
+/usr/bin/test -s /local/monitorParms/forceSeverityDowngrade
+if [ $? -eq 0 ]
 then
-   hostAppTab=/local/monitorParms/hostAppTab
-   hostArg="_${hostID}_"
-   hatLine=`/bin/grep "$hostArg" $hostAppTab`
-   if [ "$hatLine" != "" ]
+   read forceDowngradeValue < /local/monitorParms/forceSeverityDowngrade
+   /bin/echo "$forceDowngradeValue" | /bin/grep -i YES > /dev/null
+   if [ $? -eq 0 ]
    then
-      oldIFS="$IFS"
-      IFS="|"
-      set -- $hatLine
-      criticalityCode=$3
-      IFS="$oldIFS"
-      /bin/echo "  crit code: $criticalityCode" >> $logFile
-      if [ "$criticalityCode" = "N" ]
+      if [ "$alertSuffix" = "Crit" ]
       then
          alertSuffix=Warn
+         /bin/echo "severity downgraded from Crit to Warn" >> $logFile
+      else
+         if [ "$alertSuffix" = "Major" ]
+         then
+            alertSuffix=Minor
+            /bin/echo "severity downgraded from Major to Minor" >> $logFile
+         fi
       fi
-      /bin/echo "alertSuffix: $alertSuffix" >> $logFile
    fi
 fi
 #
 outLine="${alertRoot}${alertSuffix}~${location}~${app}~${hostID}~${entity}~${ocCode}~"
 /bin/echo "    outLine: ${outLine}" >> $logFile
-#ssh tsspat@nfraus /home/tsspat/scripts/ssOut Nagios 2 "${arg3}" 4 5 6 "${outLine}"
-/local/monitorScripts/${alertDriverScript} Nagios 2 "${arg3}" 4 5 6 "${outLine}"
+#
+# When arg8 (perfdata) contains the "NO NOTIFY" string, it is because the 
+# service was sent an NSCA string from this script:
+#
+#     /usr/twp/nagios/updateNagiosForFlaggedInstanceObjects
+#     (invoked by script /usr/twp/nagios/checkForAutoNagiosUpdates
+#      whenever it triggers a Nagios re-load)
+#
+# This mechanism was put in place to correct for a situation in which a Nagios
+# re-load causes objects for AWS ELB-related instances to be automatically 
+# re-deployed, setting their service statuses to OK, even if they had previously
+# been non-OK. The above script resets problem-flagged services (for AWS
+# ELB instances only) to their previous non-OK state and message BUT WE DON'T
+# WANT TO RE-NOTIFY so the alertDriver script is not invoked. With the 
+# service(s) now reverted to their non-OK state, a future CLEAR will change
+# the service state from non-OK to OK, thereby triggering this event handler
+# script and its invocation of the appropriate alertDriver script to notify
+# support personnel of the CLEAR/resolution condition.
+#
+if [ "$arg8" != "NO NOTIFY" ]
+then
+   /local/monitorScripts/${alertDriverScript} Nagios 2 "${arg3}" 4 5 6 "${outLine}"
+else
+   /bin/echo "             ${alertDriverScript} not invoked due to NO NOTIFY" >> $logFile
+fi
 #
 /bin/echo "driver arg3: " $arg3 >> $logFile
 exit 0
@@ -1214,5 +1542,5 @@ mailFile=/tmp/eventHandlerVars.$pid
 /bin/echo "5: $5" >> $mailFile
 /bin/echo "6: $6" >> $mailFile
 /bin/echo "7: $7" >> $mailFile
-mail -s "toNagios variables" andersonm@washpost.com < $mailFile
+mail -s "toNagios variables" -r monitoring@washpost.com michael.andersonm@washpost.com < $mailFile
 /bin/rm $mailFile
