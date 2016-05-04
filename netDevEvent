@@ -98,6 +98,7 @@ else
 fi
 alertRoot=""
 ocCode=commaint
+#ocCode=monadmin
 case $serviceType in
          "SNMP Object") alertRoot=SNMPObject
                         entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
@@ -125,6 +126,22 @@ if [ $? -eq 0 ]
 then
    exit 0
 fi
+#
+/usr/bin/test -s /local/monitorParms/forceSeverityDowngrade
+if [ $? -eq 0 ]
+then
+   read forceDowngradeValue < /local/monitorParms/forceSeverityDowngrade
+   /bin/echo "$forceDowngradeValue" | /bin/grep -i YES > /dev/null
+   if [ $? -eq 0 ]
+   then
+      if [ "$alertSuffix" = "Crit" ]
+      then
+         alertSuffix=Warn
+         /bin/echo "severity downgraded from Crit to Warn" >> $logFile
+      fi
+   fi
+fi
+#
 outLine="${alertRoot}${alertSuffix}~locLookup~Network~${hostID}~${entity}~${ocCode}~"
 n
 /bin/echo "    outLine: ${outLine}" >> $logFile
