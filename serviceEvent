@@ -1,0 +1,1218 @@
+#!/bin/ksh
+checkForELB ()
+{
+/bin/echo "##### checkForELB #####" >> $logFile
+#
+nagiosHostNameArg="_${nagiosHostName}_|"
+awsInstanceLine=$(/bin/grep ${nagiosHostNameArg} ${parmDir}/AWS_instance-host-xref_* | /usr/bin/head -n 1)
+if [ "$awsInstanceLine" != "" ]
+then
+   /bin/echo "      awsInstanceLine: ${awsInstanceLine}" >> $logFile
+#  An AWS-related instance line was found which may be for this host
+   oldIFS="$IFS"
+   IFS="|"
+   set -- $awsInstanceLine
+   ailHostName=$1
+   ipValue=$3
+   fqdnValue=$4
+   IFS="$oldIFS"
+   ailHostName=$(/bin/echo ${ailHostName} | /bin/cut -f2 -d":")
+   ailHostNameLength=${#ailHostName}
+   ((newLength = ailHostNameLength - 1))
+   ailHostName=$(/bin/echo ${ailHostName} | /bin/cut -c2-${newLength})
+   /bin/echo "          ailHostName: ${ailHostName}" >> $logFile
+   /bin/echo "              ipValue: ${ipValue}" >> $logFile
+   /bin/echo "            fqdnValue: ${fqdnValue}" >> $logFile
+   if [ "$ailHostName" = "$nagiosHostName" ]
+   then
+#     Prefix the slashes in parmDir for processing with sed command
+      parmDirArg=$(/bin/echo ${parmDir} | /bin/sed 's/\//\\\//g')
+      elbName=$(/bin/echo ${awsInstanceLine} | /bin/cut -f1 -d":" | /bin/sed "s/${parmDirArg}\/AWS_instance-host-xref_//g")
+      /bin/echo "              elbName: ${elbName}" >> $logFile
+      dynamicServiceFileName=AWS_dynamicServiceCaptures_${elbName}
+      dynamicServiceFile=${parmDir}/${dynamicServiceFileName}
+      /usr/bin/test -f ${dynamicServiceFile}
+      if [ $? -ne 0 ]
+      then
+         /bin/cat /dev/null > $dynamicServiceFile
+         /bin/echo "          initializing ${dynamicServiceFileName}" >> $logFile
+      else
+         /bin/echo "              detected ${dynamicServiceFileName}" >> $logFile
+      fi
+      /bin/echo "$nagiosSvcDesc" | /bin/grep ACCUMULATE > /dev/null
+      if [ $? -ne 0 ]
+      then
+         /bin/grep "$nagiosSvcDesc" $dynamicServiceFile > /dev/null
+         if [ $? -ne 0 ]
+         then
+            if [ "$nagiosApp" = "APPNAME" ]
+            then
+               dsfApp=""
+            else
+               dsfApp=$nagiosApp
+            fi
+            serviceEntry="${nagiosSvcDesc}|${nagiosAttempts}|${dsfApp}|"
+            /bin/echo "$serviceEntry" >> $dynamicServiceFile
+            /bin/echo "   adding serviceEntry ${serviceEntry}" >> $logFile
+         else
+            /bin/echo "   serviceEntry \"${nagiosSvcDesc}\" already exists" >> $logFile
+         fi
+      else
+         /bin/echo "              ignoring ${serviceEntry}" >> $logFile
+      fi
+      exit 0
+   fi
+fi
+}
+#
+hostAppTabLookup ()
+{
+/bin/echo "##### hostAppTabLookup #####" >> $logFile
+# Find entry for this hostname in "hostAppTab" in order to get the related
+# application and IP address
+hostArg="_${nagiosHostName}_"
+hatLine=$(/bin/grep ${hostArg} $hostAppTab)
+if [ "$hatLine" != "" ]
+then
+   /bin/echo "      hostAppTab  arg: ${hostArg}" >> $logFile
+   /bin/echo "                entry: ${hatLine}" >> $logFile
+   oldIFS="$IFS"
+   IFS="|"
+   set -- $hatLine
+   appValue=$2
+   ipValue=$4
+   hostType=$8
+   IFS="$oldIFS"
+   /bin/echo "             app code: ${appValue}" >> $logFile
+else
+   /bin/echo "      hostAppTab line not found" >> $logFile
+   appValue=APPNAME
+   ipValue=IPADDRESS
+   locValue=LOCATION
+   fqdnValue=ALIAS
+fi
+}
+#
+nslookupUsingHostname ()
+{
+/bin/echo "##### nslookupUsingHostname #####" >> $logFile
+#
+/usr/bin/nslookup ${nagiosHostName} | /bin/grep "Name:" | /bin/awk '{print $2}' > $nslookupFile
+nslookupOutputCount=$(/bin/cat ${nslookupFile} | /usr/bin/wc -l | /bin/sed 's/ //g')
+if [ $nslookupOutputCount -gt 0 ]
+then
+   if [ $nslookupOutputCount -eq 1 ]
+   then
+      read fqdnValue < $nslookupFile
+      /bin/echo "                 FQDN: ${fqdnValue}" >> $logFile
+      targetDir=$objectStagingDir
+      /usr/bin/test -d $targetDir
+      if [ $? -ne 0 ]
+      then
+         /bin/mkdir $targetDir
+      fi
+   else
+      /bin/echo "hostname nslookup produced multiple output lines" >> $logFile
+      /bin/echo "          FQDN not found" >> $logFile
+      fqdnValue=ALIAS
+   fi
+else
+   /bin/echo "hostname nslookup produced no output lines" >> $logFile
+   /bin/echo "          FQDN not found" >> $logFile
+   fqdnValue=ALIAS
+fi
+}
+#
+getOtherHostInfo ()
+{
+/bin/echo "##### getOtherHostInfo #####" >> $logFile
+#
+# Remove the underscores surrounding IP address in the hostAppTab entry
+ipValue=$(/bin/echo ${ipValue} | /bin/sed 's/_//g')
+/bin/echo "           IP address: ${ipValue}" >> $logFile
+# Use first two octets of the IP address to lookup the related location
+locTab=${parmDir}/octet2LocTab
+oldIFS="$IFS"
+IFS="."
+set -- $ipValue
+octet1=$1
+octet2=$2
+IFS="$oldIFS"
+octetArg="${octet1}.${octet2}."
+locValue=$(/bin/grep ${octetArg} $locTab | /bin/cut -f2 -d"|")
+if [ "$locValue" != "" ]
+then
+#  The location was determined
+   /bin/echo "             location: ${locValue}" >> $logFile
+   locValue="z${locValue}"
+#  Use nslookup to retrieve the host's FQDN
+   nslookupFile=/tmp/serviceEvent_nslookup_${pid}
+   /usr/bin/nslookup ${ipValue} | /bin/grep "name = " | /bin/cut -f2 -d"=" | /bin/sed 's/ //g' | /bin/sed 's/com\./com/g' > $nslookupFile
+   nslookupOutputCount=$(/bin/cat ${nslookupFile} | /usr/bin/wc -l | /bin/sed 's/ //g')
+   if [ $nslookupOutputCount -gt 0 ]
+   then
+      if [ $nslookupOutputCount -eq 1 ]
+      then
+         read fqdnValue < $nslookupFile
+         /bin/echo "                 FQDN: ${fqdnValue}" >> $logFile
+         targetDir=$objectStagingDir
+         /usr/bin/test -d $targetDir
+         if [ $? -ne 0 ]
+         then
+            /bin/mkdir $targetDir
+         fi
+      else
+         /bin/echo "IP nslookup output produced multiple lines" >> $logFile
+         nslookupUsingHostname
+      fi
+   else
+      /bin/echo "IP nslookup produced no output lines" >> $logFile
+      /bin/echo "          FQDN not found" >> $logFile
+      fqdnValue=ALIAS
+      nslookupUsingHostname
+   fi
+   /bin/rm $nslookupFile
+else
+   /bin/echo "      location not found" >> $logFile
+   locValue=LOCATION
+fi
+}
+#
+defineNagiosHost ()
+{
+/bin/echo "##### defineNagiosHost #####" >> $logFile
+#
+# Unless all needed variable values are determined, the model file will be
+# written to the "incomplete" directory with whatever variable values
+# are available
+targetDir=$stagingDirIncomplete
+#
+# Select the appropriate host model file
+/bin/echo "nagiosHostType: ${nagiosHostType}" >> $logFile
+case $nagiosHostType in
+   CentOS) modelCfg=${modelDir}/host_model_for_CentOS.cfg ;;
+   RedHat) modelCfg=${modelDir}/host_model_for_RedHat.cfg ;;
+   Ubuntu) modelCfg=${modelDir}/host_model_for_Ubuntu.cfg ;;
+        *) modelCfg=${modelDir}/host_model_for_UnknownOS.cfg ;;
+esac
+#
+# Is there a hostAppTab entry for this host?
+hostAppTabLookup
+if [ "$hatLine" != "" ]
+then
+#  A hostAppTab entry was found for this host
+   if [ "$hostType" != "" ]
+   then
+      /bin/echo "hostType: ${hostType}" >> $logFile
+#     The hostAppTab entry contains a "hostType" value so use it to determine
+#     if the previously selected modelCfg should be overriden
+      case $hostType in
+         AWS) modelCfg=${modelDir}/host_model_for_AWS.cfg ;;
+         VCS) modelCfg=${modelDir}/host_model_for_VCS.cfg ;;
+      esac
+   fi
+   getOtherHostInfo
+fi
+#
+/bin/cat $modelCfg | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/ALIAS/$fqdnValue/g" | /bin/sed "s/IPADDRESS/$ipValue/g" | /bin/sed "s/APPNAME/$appValue/g" | /bin/sed "s/LOCATION/$locValue/g" > ${targetDir}/${nagiosHostName}_AAA-Host.cfg
+#
+#  Create the "Ping Status" service by default for every auto-deployed host
+modelCfg=${modelDir}/generic_service_model.cfg
+/bin/cat $modelCfg | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/APPNAME/$appValue/g" | /bin/sed "s/SERVICEDESC/Ping Status/g" | /bin/sed "s/MAXCHECKATTEMPTS/1/g" | /bin/sed "s/USETEMPLATE/passive_service/g" > ${targetDir}/${nagiosHostName}_Ping.cfg
+/bin/echo "}" >> ${targetDir}/${nagiosHostName}_Ping.cfg
+/bin/echo "" >> ${targetDir}/${nagiosHostName}_Ping.cfg
+}
+#
+accumulateObjectsIntoHost ()
+{
+/bin/echo "##### accumulateObjectsIntoHost #####" >> $logFile
+#
+/usr/bin/test -f ${hostDisabledDir}/${nagiosHostName}.cfg
+if [ $? -ne 0 ]
+then
+#  This host is not represented in the "disabled" directory and is thus
+#  eligible for Nagios staging
+   hostTargetDir=$hostStagingDir
+   adjective=staged
+else
+#  This host is represented in the "disabled" directory; it is eligible to
+#  be updated with new and modified object definitions but the updated disabled
+#  version will not be eligible for Nagios configuration inclusion and disabled
+#  version updates will not trigger a Nagios reload.
+#  (A host should NOT be present in both the staged and disabled directories;
+#  if so, the staged version will be included in Nagios configuration whenever
+#  a reload is triggered, but updates to the disabled version will not be.)
+   hostTargetDir=$hostDisabledDir
+   adjective=disabled
+fi
+hostStagingLock=/tmp/hostStagingLock_${nagiosHostName}
+stagingLockFound=Yes
+lockCheckCount=0
+while [ $stagingLockFound = Yes ]
+do
+   /usr/bin/test -f $hostStagingLock
+   if [ $? -ne 0 ]
+   then
+      /bin/touch $hostStagingLock
+      /bin/echo "creating lockfile $hostStagingLock" >> $logFile
+      hostStagingFile=${hostTargetDir}/${nagiosHostName}.cfg
+      /bin/echo "initializing ${adjective} ${nagiosHostName}.cfg" >> $logFile
+      /bin/cat /dev/null > $hostStagingFile
+      for objectStagingFile in `ls $targetDir`
+      do
+         /bin/echo "adding ${objectStagingFile} to ${adjective} ${nagiosHostName}.cfg" >> $logFile
+         /bin/cat ${targetDir}/${objectStagingFile} >> $hostStagingFile
+      done
+      /bin/rm $hostStagingLock
+      /bin/echo "removing lockfile $hostStagingLock" >> $logFile
+      stagingLockFound=No
+   else
+      ((lockCheckCount = lockCheckCount + 1))
+      if [ $lockCheckCount -lt 15 ]
+      then
+         /bin/echo "$hostStagingLock found, going to sleep for two" >> $logFile
+         /bin/sleep 2
+      else
+         /bin/echo "slept too long, removing $hostStagingLock" >> $logFile
+         /bin/rm $hostStagingLock
+      fi
+   fi
+done
+}
+#
+createFlagFile ()
+{
+/bin/echo "##### createFlagFile #####" >> $logFile
+#
+flagEligible=No
+if [ $targetDir = $objectStagingDir ]
+then
+   accumulateObjectsIntoHost
+   if [ "$adjective" = "staged" ]
+   then
+#     This host is not present in the "disabled" directory so it
+#     is eligible for inclusion in Nagios configuration and reload
+      flagFile=${flagDir}/update_internal_host-service_objects
+      flagEligible=Yes
+   fi
+fi
+if [ "$targetDir" = "/tmp" ]
+then
+   flagFile=${flagDir}/update_extant_host-service_objects
+   flagEligible=Yes
+fi
+if [ $flagEligible = Yes ]
+then
+   /usr/bin/test -f $flagFile
+   if [ $? -ne 0 ]
+   then
+      /bin/touch $flagFile
+      /bin/echo "flag file was created for Nagios update" >> $logFile
+   else
+      /bin/echo "flag file for Nagios update already exists" >> $logFile
+   fi
+else
+   /bin/echo "host and services not eligible for staging, no flag created for Nagios update" >> $logFile
+fi
+}
+#
+supplyGraphiteLink ()
+{
+/bin/echo "##### supplyGraphiteLink #####" >> $logFile
+#
+graphiteLinkModel=${modelDir}/${graphiteLinkModelName}
+/usr/bin/test -s $graphiteLinkModel
+if [ $? -eq 0 ]
+then
+   /bin/echo "          found: ${graphiteLinkModelName}" >> $logFile
+   /bin/cat ${graphiteLinkModel} | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/APPNAME/${appValue}/g" | /bin/sed "s/ENTITYFOLDER/${entityFolder}/g" | /bin/sed "s/ENTITYNAME/${entityName}/g" >> $targetFile
+else
+   /bin/echo "      not found: ${graphiteLinkModelName}" >> $logFile
+fi
+}
+#
+processEntityLabelForGraphiteLink ()
+{
+/bin/echo "##### processEntityLabelForGraphiteLink #####" >> $logFile
+#
+entityLabel=$(/bin/echo ${nagiosSvcDesc} | /bin/sed 's/: /|/g' | /bin/cut -f2 -d"|")
+/bin/echo "    entityLabel: ${entityLabel}" >> $logFile
+if [ "$entityLabel" = "/" ]
+then
+   entityFolder=root
+else
+   entityCharOne=$(/bin/echo ${entityLabel} | /bin/cut -c1)
+   if [ "$entityCharOne" = "/" ]
+   then
+#     Find the length of the entityLabel string in order to remove the leading
+#     slash, then change the remaining slashes to periods to derive the needed
+#     Graphite folder(s)
+      entityLength=${#entityLabel}
+      entityFolder=$(/bin/echo ${entityLabel} | /bin/cut -c2-$entityLength | /bin/sed 's/\//./g' | /bin/sed 's/ /_/g')
+   else
+#     Change the remaining slashes to periods to derive the needed Graphite
+#     folder(s)
+      entityFolder=$(/bin/echo ${entityLabel} | /bin/sed 's/\//./g' | /bin/sed 's/ /_/g')
+   fi
+fi
+/bin/echo "   entityFolder: ${entityFolder}" >> $logFile
+# Prefix the slashes in the entityLabel with
+# backslashes for successfully use with sed
+entityName=$(/bin/echo ${entityLabel} | /bin/sed 's/\//\\\//g')
+supplyGraphiteLink
+}
+#
+serviceSetup ()
+{
+/bin/echo "##### serviceSetup #####" >> $logFile
+#
+parmDir=/local/monitorParms
+#
+oldIFS="$IFS"
+IFS="@"
+set -- $serviceOutput
+nagiosSvcType=$1
+nagiosHostName=$2
+nagiosHostType=$3
+nagiosApp=$4
+nagiosSvcDesc=$5
+nagiosAttempts=$6
+nagiosNameExt=$7
+IFS="$oldIFS"
+#
+/bin/echo "  nagiosSvcType: ${nagiosSvcType}" >> $logFile
+/bin/echo " nagiosHostName: ${nagiosHostName}" >> $logFile
+/bin/echo " nagiosHostType: ${nagiosHostType}" >> $logFile
+/bin/echo "      nagiosApp: ${nagiosApp}" >> $logFile
+/bin/echo "  nagiosSvcDesc: ${nagiosSvcDesc}" >> $logFile
+/bin/echo " nagiosAttempts: ${nagiosAttempts}" >> $logFile
+/bin/echo "  nagiosNameExt: ${nagiosNameExt}" >> $logFile
+# Check to see if this host is AWS/ELB-related
+if [ "$nagiosHostName" != "MultiHost" ]
+then
+   checkForELB
+fi
+#
+# The host is not AWS/ELB-related, we will continue processing
+#
+# Slashes must be prefixed with backslashes in order to be processed by the
+# sed command without error (and equal signs must be turned into spaces to
+# be accepted in the Nagios service object definition)
+nagiosSvcParm=$(/bin/echo ${nagiosSvcDesc} | /bin/sed 's/\//\\\//g' | /bin/sed 's/=/ /g')
+#
+nagiosMainConfig=/usr/local/nagios/etc/nagios.cfg
+if [ "$nagiosHostName" != "MultiHost" ]
+then
+   nagiosMainConfigArg="${nagiosHostName}.cfg"
+else
+   nagiosMainConfigArg="FORCE-NOT-FOUND.cfg"
+fi
+matchedMainConfigEntries=/tmp/serviceEvent_matchedMainConfigEntries_${pid}
+#nagiosMainConfigEntry=$(/bin/grep ${nagiosMainConfigArg} ${nagiosMainConfig} | /bin/grep -v "#" | /bin/awk -F/ '{print $NF}')
+/bin/grep ${nagiosMainConfigArg} ${nagiosMainConfig} | /bin/grep -v "#" | /bin/awk -F/ '{print $NF}' > $matchedMainConfigEntries
+mainConfigMatch=No
+/usr/bin/test -s $matchedMainConfigEntries
+if [ $? -eq 0 ]
+then
+   for nagiosMainConfigEntry in `/bin/cat $matchedMainConfigEntries`
+   do
+      if [ "$nagiosMainConfigEntry" = "$nagiosMainConfigArg" ]
+      then
+         mainConfigMatch=Yes
+         break
+      fi
+   done
+fi
+/usr/bin/test -f $matchedMainConfigEntries
+if [ $? -eq 0 ]
+then
+   /bin/rm $matchedMainConfigEntries
+fi
+#
+if [ "$mainConfigMatch" = "Yes" ]
+then
+   /bin/echo " Main cfg entry: ${nagiosMainConfigEntry}" >> $logFile
+   /bin/echo "   matched content:" >> $logFile
+   /bin/cat $matchedMainConfigEntries >> $logFile
+   mainConfigEntryFile=/usr/local/nagios/etc/objects/${nagiosMainConfigEntry}
+   /usr/bin/test -s $mainConfigEntryFile
+   if [ $? -eq 0 ]
+   then
+      hostInNagiosMainConfig=Yes
+      /bin/echo "         exists in /usr/local/nagios/etc/objects" >> $logFile
+#     Does a service object already exist for this service?
+      /bin/grep "$nagiosSvcDesc" $mainConfigEntryFile | /bin/grep "service_description" > /dev/null
+      if [ $? -eq 0 ]
+      then
+#        This service object has already been created for this host, exit
+         /bin/echo "         service object for ${nagiosSvcDesc} already exists, exiting" >> $logFile
+         exit 0
+      fi
+   else
+      hostInNagiosMainConfig=No
+      /bin/echo "      not found in /usr/local/nagios/etc/objects" >> $logFile
+   fi
+else
+   hostInNagiosMainConfig=No
+   if [ "$nagiosHostName" != "MultiHost" ]
+   then
+      /bin/echo "Nagios main cfg has no entry for ${nagiosHostName}" >> $logFile
+   else
+      /bin/echo "Nagios main cfg has entry for ${nagiosHostName}, ignored" >> $logFile
+   fi
+fi
+#
+flagDir=/local/monitorFlags/autoUpdateTriggers
+stageLockDir=/local/monitorFlags/lockedAutoUpdateStagingFiles
+hostAppTab=${parmDir}/hostAppTab
+modelDir=/usr/local/nagios/etc/internalObjectModels
+objectStagingDir=/usr/local/nagios/etc/internalObjectStaging/${nagiosHostName}
+hostStagingDir=/usr/local/nagios/etc/internalHostStaging
+hostDisabledDir=/usr/local/nagios/etc/internalHostDisabled
+stagingDirIncomplete=/usr/local/nagios/etc/incompleteObjectStaging
+#
+if [ "$hostInNagiosMainConfig" = "Yes" ]
+then
+#  There is already a Nagios host object and at least one service object
+#  defined in a file included in the main nagios configuration file, 
+#  therefore we don't need to create a new host object. Any new service objects
+#  will be added to the existing file defined in the main configuration.
+#  New service objects will be built in the /tmp directory.
+   targetDir=/tmp
+else
+#  This host is not represented in the main Nagios configuration file
+   /usr/bin/test -s ${objectStagingDir}/${nagiosHostName}_AAA-Host.cfg
+   if [ $? -ne 0 ]
+   then
+#     The host is not defined in the staging directory
+#     Is it defined in the "incomplete" (incomplete information) directory?
+      /usr/bin/test -s ${stagingDirIncomplete}/${nagiosHostName}_AAA-Host.cfg
+      if [ $? -ne 0 ]
+      then
+#        The host is not defined in the "incomplete" directory either
+#        so we will attempt to create it
+         if [ "$nagiosHostName" != "MultiHost" ]
+         then
+            defineNagiosHost
+         else
+            /usr/bin/test -d $objectStagingDir
+            if [ $? -ne 0 ]
+            then
+               /bin/mkdir $objectStagingDir
+               
+             fi
+             targetDir=$objectStagingDir
+         fi
+      else
+#        The host is defined in the "incomplete" directory, it is not ready
+#        to be staged and none of its related services are either
+         targetDir=$stagingDirIncomplete
+      fi
+   else
+#     The host is defined in the staging directory, therefore any related 
+#     services are also eligible to be staged
+      targetDir=$objectStagingDir
+   fi
+fi
+#
+case $nagiosSvcType in
+     HostDate|Uptime) template=passive_service ;;
+                   *) template=passive-service-with-alerts ;;
+esac
+modelName=generic_service_model.cfg
+modelCfg=${modelDir}/${modelName}
+/bin/echo "      modelName: ${modelName}" >> $logFile
+/bin/echo "      targetDir: ${targetDir}" >> $logFile
+if [ "$nagiosApp" = "APPNAME" ]
+then
+   hostAppTabLookup
+else
+   serviceGroupFile=/usr/local/nagios/etc/objects/subgroup.cfg
+   serviceGroupMatches=/tmp/serviceEvent_serviceGroups_${pid}
+   /bin/grep "$nagiosApp" ${serviceGroupFile} | /bin/grep servicegroup_name | /bin/awk '{print $2}' > $serviceGroupMatches
+   serviceGroupMatched=No
+   for serviceGroupName in `/bin/cat $serviceGroupMatches`
+   do
+      if [ "$serviceGroupName" = "$nagiosApp" ]
+      then
+         /bin/echo "${nagiosApp} is a valid Nagios service group" >> $logFile
+         appValue=$nagiosApp
+         serviceGroupMatched=Yes
+         break
+      fi
+   done
+   /bin/rm $serviceGroupMatches
+   if [ $serviceGroupMatched = No ]
+   then
+      /bin/echo "${nagiosApp} is not a valid Nagios service group" >> $logFile
+      hostAppTabLookup
+   fi
+fi
+#
+if [ "$nagiosNameExt" = "" ]
+then
+#  No name extension is provided
+   targetFileName="${nagiosHostName}_${nagiosSvcType}.cfg"
+   lockFileName="=${nagiosHostName}=_${nagiosSvcType}.cfg"
+else
+#  A name extension is provided
+   nagiosNameExtHold=$(/bin/echo ${nagiosNameExt} | /bin/sed 's/[0-9]//g')
+   if [ "$nagiosNameExtHold" != "" ]
+   then
+#     The name extension is not numeric
+      if [ "$nagiosNameExtHold" = "..." ]
+      then
+#        The name extension is an IP address
+         targetFileName="${nagiosHostName}_${nagiosSvcType}_${nagiosNameExt}.cfg"
+         lockFileName="=${nagiosHostName}=_${nagiosSvcType}_${nagiosNameExt}.cfg"
+      else
+         targetFileName="${nagiosHostName}_${nagiosNameExt}_${nagiosSvcType}.cfg"
+         lockFileName="=${nagiosHostName}=_${nagiosNameExt}_${nagiosSvcType}.cfg"
+      fi
+   else
+#     The name extension is numeric
+      targetFileName="${nagiosHostName}_${nagiosSvcType}_${nagiosNameExt}.cfg"
+      lockFileName="=${nagiosHostName}=_${nagiosSvcType}_${nagiosNameExt}.cfg"
+   fi
+fi
+/bin/echo "     targetFile: ${targetFileName}" >> $logFile
+#
+entityLabel=""
+entityName=""
+entityFolder=""
+#
+if [ "$hostInNagiosMainConfig" = "Yes" ]
+then
+   targetFile=${targetDir}/ExtantNagiosHost=${nagiosMainConfigEntry}=${targetFileName}
+else
+   targetFile=${targetDir}/${targetFileName}
+fi
+#
+case $nagiosSvcType in
+   Directory|File|Filesystem|IfacePkts|Iostat|JMX|MTR|Nginx|OldFiles|Process|ProcessCPU|ProcessMemory|URLMon)
+      lockFile=${stageLockDir}/${lockFileName}
+      case $nagiosSvcParm in
+         "ACCUMULATE START") /bin/echo "                 case ACCUMULATE START" >> $logFile
+                             /bin/cat /dev/null > $targetFile
+                             /usr/bin/test -f $lockFile
+                             if [ $? -ne 0 ]
+                             then
+                                /bin/echo "                 creating ${targetFileName} lock" >> $logFile
+                                /bin/touch $lockFile
+                             else
+                                /bin/echo "                 ${targetFileName} lock found" >> $logFile
+                             fi ;;
+          "ACCUMULATE STOP") /bin/echo "                 case ACCUMLATE STOP" >> $logFile
+                             /usr/bin/test -f $lockFile
+                             if [ $? -eq 0 ]
+                             then
+                                /bin/echo "                 removing ${targetFileName} lock" >> $logFile
+                                /bin/rm $lockFile
+                             else
+                                /bin/echo "                 ${targetFileName} lock not found" >> $logFile
+                             fi
+                             createFlagFile ;;
+                          *) /bin/cat $modelCfg | /bin/sed "s/USETEMPLATE/$template/g" | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/APPNAME/$appValue/g" | /bin/sed "s/SERVICEDESC/$nagiosSvcParm/g" | /bin/sed "s/MAXCHECKATTEMPTS/$nagiosAttempts/g" >> $targetFile
+                             graphiteLinkModelName="GraphiteLink_${nagiosSvcType}"
+                             case $nagiosSvcType in
+             Directory|Filesystem|IfacePkts|OldFiles|ProcessCPU|ProcessMemory)
+                                            processEntityLabelForGraphiteLink ;;
+                             esac
+                             /bin/echo "}" >> $targetFile
+                             /bin/echo "" >> $targetFile ;;
+      esac ;;
+   *) /bin/cat $modelCfg | /bin/sed "s/USETEMPLATE/$template/g" | /bin/sed "s/HOSTNAME/${nagiosHostName}/g" | /bin/sed "s/APPNAME/$appValue/g" | /bin/sed "s/SERVICEDESC/$nagiosSvcParm/g" | /bin/sed "s/MAXCHECKATTEMPTS/$nagiosAttempts/g" > $targetFile
+      case $nagiosSvcType in
+            CPU) graphiteLinkModelName=GraphiteLink_CPU ;;
+         Memory) graphiteLinkModelName=GraphiteLink_Memory ;;
+            SCP) graphiteLinkModelName=GraphiteLink_SCP ;;
+      esac
+      case $nagiosSvcType in
+         CPU|Memory) supplyGraphiteLink ;;
+                SCP) entityLabel=$(/bin/echo ${nagiosSvcDesc} | /bin/sed 's/: /|/g' | /bin/cut -f2 -d"|")
+                     /bin/echo "    entityLabel: ${entityLabel}" >> $logFile
+                     entityFolder=$(/bin/echo ${entityLabel} | /bin/sed 's/\./_/g')
+                     /bin/echo "   entityFolder: ${entityFolder}" >> $logFile
+                     supplyGraphiteLink ;;
+      esac
+      /bin/echo "}" >> $targetFile
+      /bin/echo "" >> $targetFile
+      createFlagFile ;;
+esac
+#
+if [ $targetDir = $stagingDirIncomplete ]
+then
+   /bin/echo "$nagiosSvcParm" | /bin/grep ACCUMULATE > /dev/null
+   if [ $? -ne 0 ]
+   then
+      serviceListFile=${targetDir}/${nagiosHostName}_ServiceList
+      /usr/bin/test -f $serviceListFile
+      if [ $? -ne 0 ]
+      then
+         /bin/cat /dev/null > $serviceListFile
+      fi
+      /bin/grep "$nagiosSvcDesc" $serviceListFile > /dev/null
+      if [ $? -ne 0 ]
+      then
+         serviceEntry="${nagiosSvcDesc}|${nagiosAttempts}|"
+         /bin/echo "$serviceEntry" >> $serviceListFile
+      fi
+   fi
+fi
+exit 0
+}
+#
+hostDateRoutine ()
+{
+hdHost=$(/bin/echo ${serviceOutput} | /bin/awk '{print $1}')
+hdSSE=$(/bin/echo ${serviceOutput} | /bin/awk '{print $2}')
+timeFileName=${hdHost}.Seconds
+timeFilePath=/local/monitorFlags/timeFiles/${timeFileName}
+/bin/echo "$hdSSE" > $timeFilePath
+/bin/echo "   timeFile: ${timeFileName}" >> $logFile
+/bin/echo "   host SSE: ${hdSSE}" >> $logFile
+exit 0
+}
+#
+postNonCritical ()
+{
+/bin/echo "$statusInfo" >> $logFile
+tab="	"
+nscaPkt="${hostID}${tab}${nagiosSvc}${tab}${forcedStatus}${tab}${statusInfo}"
+#nscaPktFile=/tmp/nscaPkt_${pid}
+#/bin/echo "$nscaPkt" > $nscaPktFile
+#/usr/local/nagios/send_nsca ${nscaTarget} -c /usr/local/nagios/send_nsca.cfg < $nscaPktFile > /dev/null 2>&1
+#/bin/rm $nscaPktFile
+/bin/echo "$nscaPkt" | /usr/local/nagios/send_nsca ${nscaTarget} -c /usr/local/nagios/send_nsca.cfg > /dev/null 2>&1
+exit 0
+}
+#
+checkAlertOverrides ()
+{
+#aoParms=/usr/twp/nagios/monitorParms/alertOverrides
+#
+if [ "$hostIDArg" = "" ]
+then
+   hostIDArg=$hostID
+fi
+if [ "$alertRootArg" = "" ]
+then
+   alertRootArg=$alertRoot
+fi
+if [ "$entityArg" = "" ]
+then
+   entityArg=$entity
+fi
+#
+aoParms=/local/monitorParms/nagiosEventHandlerOverrides
+aoArg="=${hostIDArg}=~${alertRootArg}~${entityArg}"
+/bin/echo "     ---------------------" >> $logFile
+/bin/echo "     alert override check:" >> $logFile
+/bin/echo "     AO Arg: ${aoArg}" >> $logFile
+aoLine=""
+aoLine=`/bin/cat $aoParms | /bin/grep "$aoArg"`
+if [ "$aoLine" != "" ]
+then
+   /bin/echo "    AO Line: ${aoLine}" >> $logFile
+   entityHold=`/bin/echo $aoLine | /bin/cut -f2 -d"|"`
+   ocCodeHold=`/bin/echo $aoLine | /bin/cut -f3 -d"|"`
+   alertRootHold=`/bin/echo $aoLine | /bin/cut -f4 -d"|"`
+   alertSuffixHold=`/bin/echo $aoLine | /bin/cut -f5 -d"|"`
+   if [ "$entityHold" != "" ]
+   then
+      entity=$entityHold
+   fi
+   if [ "$ocCodeHold" != "" ]
+   then
+      ocCode=$ocCodeHold
+   fi
+   if [ "$alertRootHold" != "" ]
+   then
+      alertRoot=$alertRootHold
+   fi
+   if [ "$alertSuffixHold" != "" ]
+   then
+      alertSuffix=$alertSuffixHold
+   fi
+else
+   /bin/echo "    No match in alert override parms" >> $logFile
+fi
+/bin/echo "     ---------------------" >> $logFile
+}
+#
+nscaTargetFile=/local/monitorParms/nscaTarget.dta
+/usr/bin/test -s $nscaTargetFile
+if [ $? -eq 0 ]
+then
+   read nscaTarget < $nscaTargetFile
+else
+   nscaTarget=10.10.1.1
+fi
+#
+execDate=`/bin/date`
+logDate=`/bin/date '+%C%y%m%d'`
+#logDir=/usr/twp/nagios/logFiles
+logDir=/local/monitorLogs
+logFile=${logDir}/nagiosEvents.${logDate}
+test -f $logFile
+if [ $? -ne 0 ]
+then
+   find $logDir -mtime +2 -name "nagiosEvents*" -exec /bin/rm {} ';'
+   /bin/cat /dev/null > $logFile
+fi
+/bin/echo "" >> $logFile
+/bin/echo "Executing serviceEvent event-handler: $execDate" >> $logFile
+/bin/echo "       arg1: $1" >> $logFile
+/bin/echo "       arg2: $2" >> $logFile
+/bin/echo "       arg3: $3" >> $logFile
+/bin/echo "       arg4: $4" >> $logFile
+/bin/echo "       arg5: $5" >> $logFile
+/bin/echo "       arg6: $6" >> $logFile
+/bin/echo "       arg7: $7" >> $logFile
+#
+arg1="$1"
+arg2="$2"
+arg3="$3"
+app=$4
+serviceOutput="$6"
+altApp=$7
+if [ "$altApp" != "" ]
+then
+   app=$altApp
+fi
+hostID=$5
+if [ "$hostID" != "nonTWP" ]
+then
+   location=locLookup
+else
+   location=nonTWP
+fi
+#
+pid=$$
+nagiosSvc=$3
+statusInfo="$6"
+#
+hostIDArg=""
+alertRootArg=""
+entityArg=""
+#
+case "$statusInfo" in
+                   "could not fetch information from server") exit 0 ;;
+                              "capture-metric count is zero") exit 0 ;;
+#                                       "Connection refused") exit 0 ;;
+                                        "forced okay status") exit 0 ;;
+                                     "forced warning status") exit 0 ;;
+                           "Free disk space : Invalid drive") exit 0 ;;
+                           "No data was received from host!") exit 0 ;;
+                       "non-numeric value returned, exiting") exit 0 ;;
+                       "NSClient - ERROR: Invalid password.") exit 0 ;;
+                             "prior execution not completed") exit 0 ;;
+                                                    "(null)") exit 0 ;;
+                     "(Return code of 137 is out of bounds)")
+                                             statusInfo="forced okay status"
+                                             forcedStatus=0
+                                             postNonCritical ;;
+                     "(Return code of 255 is out of bounds)")
+                                             statusInfo="forced okay status"
+                                             forcedStatus=0
+                                             postNonCritical ;;
+"(Return code of 127 is out of bounds - plugin may be missing)") exit 0 ;;
+     "script unable to identify logfile for metrics capture") exit 0 ;;
+                                 "(Service Check Timed Out)")
+                                             statusInfo="forced warning status"
+                                             forcedStatus=1
+                                             postNonCritical ;;
+                             "value not identified, exiting") exit 0 ;;
+esac
+/bin/echo "$6" | /bin/grep "Socket timeout after" > /dev/null
+if [ $? -eq 0 ]
+then
+   exit 0
+fi
+case $1 in
+         OK) alertSuffix=Okay ;;
+    WARNING) alertSuffix=Warn ;;
+   CRITICAL) alertSuffix=Crit ;;
+          *) alertSuffix=Warn ;;
+esac
+/bin/echo "alertSuffix: $alertSuffix" >> $logFile
+if [ $alertSuffix != Okay ]
+then
+   if [ $2 = SOFT ]
+   then
+      /bin/echo "exit due to non-Okay and SOFT" >> $logFile
+      exit 0
+   fi
+fi
+#
+ocCode=occLookup
+#
+/bin/echo $3 | /bin/grep ": " > /dev/null
+if [ $? -eq 0 ]
+then
+   serviceType=`/bin/echo $3 | /bin/sed 's/: /|/g' | /bin/cut -f1 -d"|"`
+   entity=`/bin/echo $3 | /bin/sed "s/$serviceType: //g"`
+else
+   serviceType=$3
+   entity=""
+fi
+#
+/bin/echo "serviceType: ${serviceType}" >> $logFile
+/bin/echo "     entity: ${entity}" >> $logFile
+#
+alertRoot=""
+alertDriverScript=alertDriver
+case $serviceType in
+"AdPoint Replication Status") alertRoot=AdPointRepl
+                            entity=AdPointRepl
+                            checkAlertOverrides ;;
+          "Amazon Service") alertRoot=AmazonSvcs
+                            entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                            entityArg=AmazonSvcs
+                            checkAlertOverrides ;;
+       "Apache Statistics") alertRoot=Apache
+                            entity=Apache
+                            checkAlertOverrides ;;
+   "Apache Response Times") alertRoot=ApacheResponseTime
+                            entity=ApacheResponseTime
+                            checkAlertOverrides ;;
+           "Argus Metrics") alertRoot=Argus
+                            entity=Argus
+                            checkAlertOverrides ;;
+ "Cache Profile Statistic") alertRoot=CacheProfStat
+                            entity=CacheProfStat
+                            checkAlertOverrides ;;
+ "Chartbeat HomePage Counts") alertRoot=Chartbeat
+                              entity=Chartbeat
+                              checkAlertOverrides ;;
+     "CPU Utilization") alertRoot=CPU
+                        entity=CPU
+                        checkAlertOverrides ;;
+            "CPU Load") alertRoot=CPU
+                        entity=CPU
+                        checkAlertOverrides ;;
+       "debuginfo.jsp") alertRoot=DebugJSP
+                        entity=debugjsp
+                        checkAlertOverrides ;;
+             Directory) alertRoot=Directory
+                        checkAlertOverrides ;;
+        "DNS Response") alertRoot=DNSResponse
+                        checkAlertOverrides ;;
+         "Drive Space") alertRoot=Drive
+                        checkAlertOverrides ;;
+     "ELB Host Health") alertRoot=ELBHostHealth
+                        entity=ELB-instances
+                        checkAlertOverrides ;;
+ "ELB Instance Health") alertRoot=ELBInstanceHealth
+                        entity=ELB-instances
+                        checkAlertOverrides ;;
+"ELB Instance Retrieval") alertRoot=ELBGetInstances
+                        entity=ELB-instances
+                        checkAlertOverrides ;;
+         "ELB Latency") alertRoot=ELBLatency
+                        entity=ELBLatency
+                        checkAlertOverrides ;;
+"Eomdb Call Statistics") alertRoot=EomdbCallStats
+                        checkAlertOverrides ;;
+                  File) alertRoot=File
+                        checkAlertOverrides ;;
+"File SCP Performance") alertRoot=SCP
+                        ocCode=commaint ;;
+            Filesystem) alertDriverScript=alertDriverRmt ;;
+   "Host Date Capture") hostDateRoutine ;;
+            "Idoc Age") alertRoot=IdocAge
+                        entity=IdocAge
+                        checkAlertOverrides ;;
+   "Interface Packets") alertRoot=Iface
+                        checkAlertOverrides ;;
+  "IVR Voice Channels") alertRoot=IVRVChan
+                        entity=VoiceChannels
+                        checkAlertOverrides ;;
+                   JMX) alertRoot=JMXMBean
+                        jmxEntity=$entity
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        /bin/echo "$hostID" | /bin/grep "secure" > /dev/null
+                        if [ $? -eq 0 ]
+                        then
+                           hostIDArg="${app}HostsPCI"
+                        else
+                           hostIDArg="${app}Hosts"
+                        fi
+                        entityArg=$app
+                        checkAlertOverrides ;;
+ "Service Setup Capture") serviceSetup ;;
+ "Jobs EDR TX Queue Length") alertRoot=JETQL
+                        entity=JobsEDRTXQueueLength
+                        checkAlertOverrides ;;
+       "LDAP Response") alertRoot=LDAPResponse
+                        checkAlertOverrides ;;
+        "Memory Usage") alertRoot=Memory
+                        entity=Memory
+                        checkAlertOverrides ;;
+               Metadev) alertDriverScript=alertDriverRmt ;;
+     "Meter Use Cases") alertRoot=MeterUseCases
+                        location=Tysons
+                        checkAlertOverrides ;;
+ "Mobile Server Side Telemetry") alertRoot=MSST
+                        entity=MobileServerSideTelemetry
+                        checkAlertOverrides ;;
+ "Mongo DB Statistics") alertRoot=MongoDB
+                        if [ "$entity" = "" ]
+                        then
+                           entity=MongoDBStats
+                        else
+                           entity="MongoDBStats:${entity}"
+                        fi
+                        checkAlertOverrides ;;
+      "MTR Statistics") alertRoot=MTR
+                        hostIDArg=MTRHosts
+                        entityArg=MTR
+                        checkAlertOverrides ;;
+"MySQL Replication Status") alertRoot=MySQLRepl
+                        entity=MySQLRepl
+                        checkAlertOverrides ;;
+   "NetApp Statistics") alertRoot=NetAppStats
+                        entity=NetAppStats
+                        checkAlertOverrides ;;
+"Nginx Response Times") alertRoot=Nginx
+                        checkAlertOverrides ;;
+"Notifier Memory Footprint") alertRoot=NotifierMemory
+                        entity=NotifierMemory
+                        checkAlertOverrides ;;
+     "Old Files Check") alertRoot=OldFile
+                        checkAlertOverrides ;;
+ "Omniture Record Recency") alertRoot=OmniRecs
+                        entity=OmniRecs
+                        checkAlertOverrides ;;
+         "Ping Status") alertRoot=Ping
+                        entity=Ping
+                        checkAlertOverrides ;;
+"Oracle DB Connect Status") alertRoot=OracleConnect
+                        checkAlertOverrides
+                        entity="OracleConnect_${entity}" ;;
+      "Oracle Metrics") alertRoot=OracleMetrics
+                        checkAlertOverrides ;;
+"Politistream Metrics") alertRoot=Politistream
+                        entity=Politistream
+                        checkAlertOverrides ;;
+"Portal Processing Times") alertRoot=PortalProcTime
+                        entity=PortalProcTime
+                        checkAlertOverrides ;;
+ "Portal Publish Time") alertRoot=PortalPubTime
+                        entity=PortalPubTime
+                        checkAlertOverrides ;;
+    "Postgres Metrics") alertRoot=Postgres
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+"Postgres archive_ready") alertRoot=PostgresArchive
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+      "Postgres bloat") alertRoot=PostgresBloat
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+ "Postgres connection") alertRoot=PostgresConn
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+"Postgres last_analyze") alertRoot=PostgresAnalyze
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+"Postgres last_autovacuum") alertRoot=PostgresAutovac
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+"Postgres last_vacuum") alertRoot=PostgresVac
+                        alertRootArg=Postgres
+                        entityArg=Postgres
+                        checkAlertOverrides ;;
+               Process) alertRoot=Process
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+"Process Availability") alertDriverScript=alertDriverRmt ;;
+       "Process count") alertRoot=ProcCount
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+"Process Memory Footprint") alertRoot=ProcMem
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+"prodArch Servlet Statistics") alertRoot=prodArchServletStats
+                        entity=prodArchServletStats
+                        checkAlertOverrides ;;
+"RDS Free Storage Space") alertRoot=RDSFreeSpace
+                        entity=RDSFreeSpace
+                        checkAlertOverrides ;;
+   "Replica Set Stats") alertRoot=ReplSetStats
+                        if [ "$entity" = "" ]
+                        then
+                           entity=ReplSetStats
+                        else
+                           entity="ReplSetStats:${entity}"
+                        fi
+                        checkAlertOverrides ;;
+ "Server Availability") alertRoot=Server
+                        entity=`/bin/echo $6 | /bin/cut -f1 -d":" | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+               Service) alertRoot=Service
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides
+                        if [ "$alertRoot" = "ClusSvc" ]
+                        then
+                           if [ "$alertSuffix" = "Crit" ]
+                           then
+                              alertSuffix=Down
+                           else
+                              alertSuffix=Up
+                           fi
+                        fi ;;
+         "SNMP Object") alertRoot=SNMPObject
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+         "SNMP Object Group") alertRoot=SNMPObjectGrp
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+"Single Copy Job Failures") alertRoot=SingleCopyJobs
+                        entity=SingleCopyJobs
+                        checkAlertOverrides ;;
+ "SiteSearch Article Recency") alertRoot=SearchArticleRecency
+                        entity=SearchArticleRecency
+                        checkAlertOverrides ;;
+ "Synthetic PortalPub Transaction") alertRoot=SynPortalPub
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+"Time And Labor Swipe Times") alertRoot=SwipeTimes
+                        entity=SwipeTimes
+                        checkAlertOverrides ;;
+                URLMon) alertDriverScript=alertDriverRmt ;;
+ "Versant DB Sessions") alertRoot=VersantDBSessions
+                        entity=VersantDBSessions
+                        checkAlertOverrides ;;
+    "Versant DB Space") alertRoot=VersantDBSpace
+                        entity=VersantDBSpace
+                        checkAlertOverrides ;;
+"Versant Memory Footprint") alertRoot=VersantMemory
+                        entity=VersantMemory
+                        checkAlertOverrides ;;
+  "Versant Statistics") alertRoot=VersantStats
+                        entity=VersantStats
+                        checkAlertOverrides ;;
+           WebPageTest) alertRoot=WebPageTest
+                        entity=WebPageTest
+                        checkAlertOverrides ;;
+                   URL) exit 0 ;;
+          "ZFS device") alertDriverScript=alertDriverRmt ;;
+esac
+#
+/bin/echo "     script: ${alertDriverScript}" >> $logFile
+#
+/bin/echo "  alertRoot: $alertRoot" >> $logFile
+if [ "$6" != "" ]
+then
+   if [ "$serviceType" != "JMX" ]
+   then
+      arg3=`/bin/echo "$6" | /bin/sed 's/ /~/g'`
+   else
+      arg3="${6} for ${jmxEntity}"
+      arg3=`/bin/echo $arg3 | /bin/sed 's/ /~/g'`
+   fi
+else
+   arg3="no~service~output~data~available"
+fi
+#
+# If the received message contains one of these values, it has come from one of the
+# alert "driver" scripts and should be dropped so as not to be sent back to that script
+/bin/echo "$arg3" | /bin/grep -E "indicates|Message~suppressed|one-hour-old" > /dev/null
+if [ $? -eq 0 ]
+then
+   /bin/echo "alert message from ${alertDriverScript}, exiting" >> $logFile
+   exit 0
+fi
+#
+if [ "$alertDriverScript" = "alertDriverRmt" ]
+then
+   remoteString=`/bin/echo "${6}" | /bin/sed 's/@/~/g' | /bin/sed 's/ /@/g'`
+   /local/monitorScripts/${alertDriverScript} "${remoteString}"
+   exit 0
+fi
+#
+if [ "$alertRoot" = "" ]
+then
+   exit 0
+fi
+if [ "$alertRoot" = "JMXMBean" ]
+then
+   case $app in
+      GOG)
+         appEnv=`/bin/echo $entity | /bin/cut -f1 -d"@"`
+         case $appEnv in
+            GOG-A) case $hostID in
+                      glassfish1) hostID=glassfish1a ;;
+                      glassfish2) hostID=glassfish2a ;;
+                      glassfish3) hostID=glassfish3a ;;
+                      glassfish4) hostID=glassfish4a ;;
+                   esac ;;
+            GOG-B) case $hostID in
+                      glassfish1) hostID=glassfish1b ;;
+                      glassfish2) hostID=glassfish2b ;;
+                      glassfish3) hostID=glassfish3b ;;
+                      glassfish4) hostID=glassfish4b ;;
+                   esac ;;
+         esac ;;
+      MobileWaPo)
+         appEnv=`/bin/echo $entity | /bin/cut -f1 -d"@"`
+         case $appEnv in
+            MobileWaPo-A) case $hostID in
+                      glassfish1) hostID=mobilefish1a ;;
+                      glassfish3) hostID=mobilefish3a ;;
+                      glassfish4) hostID=mobilefish4a ;;
+                   esac ;;
+            MobileWaPo-B) case $hostID in
+                      glassfish2) hostID=mobilefish2b ;;
+                      glassfish5) hostID=mobilefish5b ;;
+                      glassfish6) hostID=mobilefish6b ;;
+                   esac ;;
+         esac ;;
+   esac
+fi
+#
+if [ "$alertSuffix" = "Crit" ]
+then
+   hostAppTab=/local/monitorParms/hostAppTab
+   hostArg="_${hostID}_"
+   hatLine=`/bin/grep "$hostArg" $hostAppTab`
+   if [ "$hatLine" != "" ]
+   then
+      oldIFS="$IFS"
+      IFS="|"
+      set -- $hatLine
+      criticalityCode=$3
+      IFS="$oldIFS"
+      /bin/echo "  crit code: $criticalityCode" >> $logFile
+      if [ "$criticalityCode" = "N" ]
+      then
+         alertSuffix=Warn
+      fi
+      /bin/echo "alertSuffix: $alertSuffix" >> $logFile
+   fi
+fi
+#
+outLine="${alertRoot}${alertSuffix}~${location}~${app}~${hostID}~${entity}~${ocCode}~"
+/bin/echo "    outLine: ${outLine}" >> $logFile
+#ssh tsspat@nfraus /home/tsspat/scripts/ssOut Nagios 2 "${arg3}" 4 5 6 "${outLine}"
+/local/monitorScripts/${alertDriverScript} Nagios 2 "${arg3}" 4 5 6 "${outLine}"
+#
+/bin/echo "driver arg3: " $arg3 >> $logFile
+exit 0
+mailFile=/tmp/eventHandlerVars.$pid
+/bin/echo "1: $1" > $mailFile
+/bin/echo "2: $2" >> $mailFile
+/bin/echo "3: $3" >> $mailFile
+/bin/echo "4: $4" >> $mailFile
+/bin/echo "5: $5" >> $mailFile
+/bin/echo "6: $6" >> $mailFile
+/bin/echo "7: $7" >> $mailFile
+mail -s "toNagios variables" andersonm@washpost.com < $mailFile
+/bin/rm $mailFile
