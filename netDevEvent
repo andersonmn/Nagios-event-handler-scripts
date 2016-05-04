@@ -1,0 +1,146 @@
+#!/bin/ksh
+checkAlertOverrides ()
+{
+#aoParms=/usr/twp/nagios/monitorParms/alertOverrides
+aoParms=/local/monitorParms/nagiosEventHandlerOverrides
+aoArg="=${hostID}=~${alertRoot}~${entity}"
+aoLine=""
+aoLine=`/bin/cat $aoParms | /bin/grep "$aoArg"`
+if [ "$aoLine" != "" ]
+then
+   entityHold=`/bin/echo $aoLine | /bin/cut -f2 -d"|"`
+   ocCodeHold=`/bin/echo $aoLine | /bin/cut -f3 -d"|"`
+   alertRootHold=`/bin/echo $aoLine | /bin/cut -f4 -d"|"`
+   alertSuffixHold=`/bin/echo $aoLine | /bin/cut -f5 -d"|"`
+   if [ "$entityHold" != "" ]
+   then
+      entity=$entityHold
+   fi
+   if [ "$ocCodeHold" != "" ]
+   then
+      ocCode=$ocCodeHold
+   fi
+   if [ "$alertRootHold" != "" ]
+   then
+      alertRoot=$alertRootHold
+   fi
+   if [ "$alertSuffixHold" != "" ]
+   then
+      alertSuffix=$alertSuffixHold
+   fi
+fi
+}
+#
+execDate=`date`
+logDate=`date '+%C%y%m%d'`
+logDir=/local/monitorLogs
+logFile=${logDir}/nagiosEvents.${logDate}
+test -f $logFile
+if [ $? -ne 0 ]
+then
+   find $logDir -mtime +3 -name "nagiosEvents*" -exec rm {} ';'
+   cat /dev/null > $logFile
+fi
+/bin/echo "" >> $logFile
+/bin/echo "Executing netDevEvent event-handler: $execDate" >> $logFile
+/bin/echo "       arg1: $1" >> $logFile
+/bin/echo "       arg2: $2" >> $logFile
+/bin/echo "       arg3: $3" >> $logFile
+/bin/echo "       arg4: $4" >> $logFile
+/bin/echo "       arg5: $5" >> $logFile
+/bin/echo "       arg6: $6" >> $logFile
+/bin/echo "       arg7: $7" >> $logFile
+#
+hostID=$1
+case $2 in
+            UP) if [ "$6" != "" ]
+                then
+                   case $6 in
+                            OK) alertSuffix=Okay ;;
+                       WARNING) alertSuffix=Warn ;;
+                      CRITICAL) alertSuffix=Crit ;;
+                             *) alertSuffix=Okay ;;
+                   esac
+                else
+                   alertSufix=Okay
+                fi ;;
+          DOWN) alertSuffix=Crit ;;
+   UNREACHABLE) alertSuffix=Crit ;;
+             *) alertSuffix=Warn ;;
+esac
+#if [ "$2" = "" ]
+#then
+#   case $6 in
+#            OK) alertSuffix=Okay ;;
+#       WARNING) alertSuffix=Warn ;;
+#      CRITICAL) alertSuffix=Crit ;;
+#             *) alertSuffix=Warn ;;
+#   esac
+#fi
+/bin/echo "alertSuffix: $alertSuffix" >> $logFile
+if [ $alertSuffix != Okay ]
+then
+   if [ $3 = SOFT ]
+   then
+      /bin/echo "exit due to non-Okay and SOFT" >> $logFile
+      exit 0
+   fi
+fi
+#
+/bin/echo $5 | /bin/grep ": " > /dev/null
+if [ $? -eq 0 ]
+then
+   serviceType=`/bin/echo $5 | /bin/sed 's/: /|/g' | /bin/cut -f1 -d"|"`
+   entity=`/bin/echo $5 | /bin/sed "s/$serviceType: //g"`
+else
+   serviceType=$5
+   entity=""
+fi
+alertRoot=""
+ocCode=commaint
+case $serviceType in
+         "SNMP Object") alertRoot=SNMPObject
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+         "SNMP Object Group") alertRoot=SNMPObjectGrp
+                        entity=`/bin/echo $entity | /bin/sed 's/ /@/g'`
+                        checkAlertOverrides ;;
+                     *) alertRoot=Ping
+                        entity=Ping
+                        checkAlertOverrides ;;
+esac
+if [ "$7" != "" ]
+then
+   if [ "$7" != "(Return code of 255 is out of bounds)" ]
+   then
+      arg3=`/bin/echo "$7" | /bin/sed 's/ /~/g'`
+   else
+      exit 0
+   fi
+else
+   arg3="no~service~output~data~available"
+fi
+/bin/echo "$arg3" | grep -E "indicates|Message~suppressed|one-hour-old" > /dev/null
+if [ $? -eq 0 ]
+then
+   exit 0
+fi
+outLine="${alertRoot}${alertSuffix}~locLookup~Network~${hostID}~${entity}~${ocCode}~"
+n
+/bin/echo "    outLine: ${outLine}" >> $logFile
+#ssh tsspat@nfraus /home/tsspat/scripts/ssOut Nagios netDevice 3 4 5 6 "${outLine}"
+/local/monitorScripts/alertDriver Nagios netDevice "${arg3}" 4 5 6 "${outLine}"
+#
+/bin/echo "driver arg3: " $arg3 >> $logFile
+exit 0
+pid=$$
+mailFile=/tmp/eventHandlerVars.$pid
+/bin/echo "1: $1" > $mailFile
+/bin/echo "2: $2" >> $mailFile
+/bin/echo "3: $3" >> $mailFile
+/bin/echo "4: $4" >> $mailFile
+/bin/echo "5: $5" >> $mailFile
+/bin/echo "6: $6" >> $mailFile
+/bin/echo "7: $7" >> $mailFile
+mail -s "toNagios variables" andersonm@washpost.com < $mailFile
+rm $mailFile
